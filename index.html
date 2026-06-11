@@ -1,0 +1,963 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Feature Timeline</title>
+  <script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+  <!-- Firebase -->
+  <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
+  <script>
+    firebase.initializeApp({
+      apiKey: "AIzaSyB_qb0j29s_w-vEPJVKhQ6QgJ2w90qAc80",
+      authDomain: "dockbank-c6ad2.firebaseapp.com",
+      projectId: "dockbank-c6ad2",
+      storageBucket: "dockbank-c6ad2.firebasestorage.app",
+      messagingSenderId: "669801321141",
+      appId: "1:669801321141:web:362a09d8a373031a2c64fc",
+    });
+    const fbAuth = firebase.auth();
+    const fbDb   = firebase.firestore();
+    const googleProvider = new firebase.auth.GoogleAuthProvider();
+    googleProvider.setCustomParameters({ prompt: 'select_account' });
+  </script>
+  <script>
+    /* ─── CONTROLE DE ACESSO ──────────────────────────────────────── *
+     * Edite aqui quem pode acessar o app.                             *
+     * Opção 1 → domínio: qualquer @suaempresa.com entra              *
+     * Opção 2 → lista explícita de e-mails (deixe o domínio vazio)   *
+     * ──────────────────────────────────────────────────────────────  */
+    const ACCESS_DOMAIN = 'dock.tech';      // ex: 'dock.tech' ou '' para desativar
+    const ACCESS_EMAILS = [                 // lista adicional (qualquer domínio)
+      // 'fulano@gmail.com',
+    ];
+    function isAllowed(email) {
+      if (!email) return false;
+      const e = email.toLowerCase();
+      if (ACCESS_DOMAIN && e.endsWith('@' + ACCESS_DOMAIN)) return true;
+      return ACCESS_EMAILS.map(x => x.toLowerCase()).includes(e);
+    }
+  </script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { height: 100%; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Helvetica Neue', Arial, sans-serif;
+           background: #EFEDE8; color: #1c1c1e; -webkit-font-smoothing: antialiased; }
+    input, textarea, button { font-family: inherit; }
+    button { cursor: pointer; background: none; border: none; }
+    input[type=number]::-webkit-inner-spin-button { -webkit-appearance: none; }
+    input[type=number] { -moz-appearance: textfield; }
+    ::selection { background: #00C0B022; }
+    .gantt-scroll { overflow-x: auto; overflow-y: visible; }
+    .gantt-scroll::-webkit-scrollbar { height: 5px; }
+    .gantt-scroll::-webkit-scrollbar-track { background: transparent; }
+    .gantt-scroll::-webkit-scrollbar-thumb { background: #D2D6DB; border-radius: 3px; }
+  </style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useRef, useMemo, useCallback } = React;
+
+const TEAL      = '#00BFB3';
+const TEAL_DARK = '#009D90';
+const TEAL_BG   = '#EAF8F7';
+const GRAY_BAR  = '#D2D6DB';
+const STORAGE    = 'dock-timeline-v2';
+const MY_CLIENT  = String(Date.now()); // session ID — prevents Firestore echo loops
+
+const formatTs = ts => {
+  const d = Date.now() - ts;
+  if (d < 60000)     return 'agora mesmo';
+  if (d < 3600000)   return `há ${Math.floor(d/60000)} min`;
+  if (d < 86400000)  return `há ${Math.floor(d/3600000)}h`;
+  if (d < 172800000) return 'ontem';
+  return new Date(ts).toLocaleDateString('pt-BR', { day:'2-digit', month:'2-digit', hour:'2-digit', minute:'2-digit' });
+};
+const WW        = 100;  /* px per week column */
+const LW        = 210;  /* px for label column in gantt */
+
+let _c = 0;
+const uid = () => `${Date.now()}${++_c}`;
+
+/* ─── default data ─────────────────────────────────────────────── */
+const makeDefaultTab = (name = 'Nova timeline') => ({
+  id: uid(), name, startDate: getThisMonday(), sections: []
+});
+const makeDefault = () => [makeDefaultTab('Cronograma DockBank')];
+
+/* ─── EditText ─────────────────────────────────────────────────── */
+function EditText({ value, onChange, style, placeholder = 'editar…', oneLine = true }) {
+  const [on, setOn] = useState(false);
+  const ref = useRef();
+  useEffect(() => { if (on && ref.current) { ref.current.focus(); ref.current.select?.(); } }, [on]);
+  const save = e => { const v = e.target.value.trim(); onChange(v || value); setOn(false); };
+  const kd = e => { if (e.key === 'Enter' && oneLine) ref.current.blur(); if (e.key === 'Escape') setOn(false); };
+  if (on) return (
+    <input ref={ref} defaultValue={value} onBlur={save} onKeyDown={kd}
+      style={{ ...style, border: 'none', borderBottom: `1.5px solid ${TEAL}`, outline: 'none',
+        background: 'transparent', padding: '1px 0', width: '100%', minWidth: 60 }} />
+  );
+  return (
+    <span onClick={() => setOn(true)} title="Clique para editar" style={{ ...style, cursor: 'text', display: 'block' }}>
+      {value || <span style={{ color: '#C0C4CA', fontStyle: 'italic', fontWeight: 400 }}>{placeholder}</span>}
+    </span>
+  );
+}
+
+/* ─── EditDays ─────────────────────────────────────────────────── */
+function EditDays({ value, onChange, style }) {
+  const [on, setOn] = useState(false);
+  const ref = useRef();
+  useEffect(() => { if (on && ref.current) { ref.current.focus(); ref.current.select(); } }, [on]);
+  if (on) return (
+    <input ref={ref} type="number" step="0.5" defaultValue={value ?? ''} placeholder="0"
+      onBlur={e => { const v = e.target.value === '' ? null : parseFloat(e.target.value); onChange(isNaN(v) ? null : v); setOn(false); }}
+      onKeyDown={e => { if (e.key === 'Enter') ref.current.blur(); }}
+      style={{ width: 40, textAlign: 'right', border: 'none', borderBottom: `1.5px solid ${TEAL}`,
+        outline: 'none', background: 'transparent', ...style }} />
+  );
+  return (
+    <span onClick={() => setOn(true)} title="Clique para editar" style={{ ...style, cursor: 'pointer' }}>
+      {value === null || value === undefined ? '—' : value}
+    </span>
+  );
+}
+
+/* ─── STATUS ───────────────────────────────────────────────────── */
+const STATUS = {
+  done:          { next: 'pending',     label: '✓ Pronto',    color: '#8A9099', bg: '#F0F1F3' },
+  'in-progress': { next: 'done',        label: '● Andamento', color: TEAL_DARK, bg: TEAL_BG   },
+  pending:       { next: 'in-progress', label: '○ Pendente',  color: '#9BA0A8', bg: '#F5F5F4' },
+};
+
+/* ─── ItemRow ──────────────────────────────────────────────────── */
+function ItemRow({ item, maxDays, onUpdate, onDelete }) {
+  const [hov, setHov] = useState(false);
+  const isDone = item.status === 'done';
+  const isActive = item.status === 'in-progress';
+  const s = STATUS[item.status];
+  const barPct = isDone ? 100 : (maxDays > 0 ? Math.min(100, ((item.demoDays || 0) / maxDays) * 100) : 0);
+  const upd = patch => onUpdate({ ...item, ...patch });
+  return (
+    <div onMouseEnter={() => setHov(true)} onMouseLeave={() => setHov(false)}
+      style={{ display: 'grid', gridTemplateColumns: '230px 1fr 108px 80px 72px', alignItems: 'center',
+        minHeight: 52, borderBottom: '1px solid #ECEEF0',
+        background: isActive ? TEAL_BG : hov ? '#FAFAF9' : '#fff',
+        borderLeft: `3px solid ${isActive ? TEAL : 'transparent'}`, transition: 'background 0.1s' }}>
+      <div style={{ padding: '8px 8px 8px 14px' }}>
+        <EditText value={item.title} placeholder="Nome da feature" oneLine onChange={v => upd({ title: v })}
+          style={{ fontSize: 14, fontWeight: isDone ? 400 : 500, color: isDone ? '#9BA0A8' : '#1c1c1e', lineHeight: 1.3 }} />
+        <EditText value={item.subtitle} placeholder="+ subtítulo" oneLine onChange={v => upd({ subtitle: v })}
+          style={{ fontSize: 11, color: '#9BA0A8', marginTop: 2, lineHeight: 1.3 }} />
+      </div>
+      <div style={{ padding: '0 20px' }}>
+        <div style={{ height: 5, borderRadius: 3, background: '#E8EAED', overflow: 'hidden' }}>
+          <div style={{ width: `${barPct}%`, height: '100%', background: isDone ? GRAY_BAR : TEAL,
+            borderRadius: 3, transition: 'width 0.3s ease' }} />
+        </div>
+      </div>
+      <div style={{ textAlign: 'center', padding: '0 6px' }}>
+        <button onClick={() => upd({ status: s.next })} title="Clique para mudar status"
+          style={{ fontSize: 10, fontWeight: 700, letterSpacing: 0.3, color: s.color, background: s.bg,
+            borderRadius: 4, padding: '3px 8px', whiteSpace: 'nowrap' }}>
+          {s.label}
+        </button>
+      </div>
+      <div style={{ textAlign: 'right', paddingRight: 8 }}>
+        {isDone ? <span style={{ fontSize: 12, color: '#D0D4D9' }}>—</span> : (
+          <span style={{ display: 'inline-flex', alignItems: 'baseline', gap: 1, fontSize: 15,
+            fontWeight: 700, color: TEAL, fontVariantNumeric: 'tabular-nums' }}>
+            ~<EditDays value={item.demoDays} onChange={v => upd({ demoDays: v })}
+              style={{ fontSize: 15, fontWeight: 700, color: TEAL, width: 28, textAlign: 'right' }} />d
+          </span>
+        )}
+      </div>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: 4, paddingRight: 12 }}>
+        {item.apiDays === null ? (
+          <span onClick={() => upd({ apiDays: 1 })} title="Clique para adicionar"
+            style={{ fontSize: 12, color: '#D0D4D9', cursor: 'pointer' }}>—</span>
+        ) : (
+          <span style={{ display: 'inline-flex', alignItems: 'baseline', gap: 0, fontSize: 13,
+            color: item.apiDays < 0 ? '#D07070' : '#6B7280', fontVariantNumeric: 'tabular-nums' }}>
+            {item.apiDays >= 0 ? '+' : ''}
+            <EditDays value={item.apiDays} onChange={v => upd({ apiDays: v })}
+              style={{ fontSize: 13, color: 'inherit', width: 26, textAlign: 'right' }} />d
+          </span>
+        )}
+        <button onClick={onDelete} title="Remover"
+          style={{ fontSize: 16, color: hov ? '#C8CDD3' : 'transparent', lineHeight: 1,
+            padding: '0 2px', transition: 'color 0.1s' }}>×</button>
+      </div>
+    </div>
+  );
+}
+
+/* ─── SectionBlock ─────────────────────────────────────────────── */
+function SectionBlock({ section, maxDays, onUpdate, onDelete, onAddItem,
+  onDragStart, onDragOver, onDrop, onDragEnd, isDragging, isDropTarget }) {
+  const [hov, setHov] = useState(false);
+  const canDrag = useRef(false);
+  const upd = patch => onUpdate({ ...section, ...patch });
+  const updateItem = (id, u) => upd({ items: section.items.map(i => i.id === id ? u : i) });
+  const deleteItem = id => upd({ items: section.items.filter(i => i.id !== id) });
+  return (
+    <div
+      draggable={true}
+      onDragStart={e => { if (!canDrag.current) { e.preventDefault(); return; } onDragStart(); }}
+      onDragOver={e => { e.preventDefault(); onDragOver(); }}
+      onDrop={onDrop}
+      onDragEnd={onDragEnd}
+      style={{ opacity: isDragging ? 0.35 : 1, transition: 'opacity 0.15s',
+        borderTop: isDropTarget ? `2px solid ${TEAL}` : '2px solid transparent' }}>
+      <div onMouseEnter={() => setHov(true)} onMouseLeave={() => setHov(false)}
+        style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '14px 14px 7px', borderBottom: '1px solid #ECEEF0' }}>
+        {/* drag handle */}
+        <span
+          onMouseDown={() => { canDrag.current = true; }}
+          onMouseUp={() => { canDrag.current = false; }}
+          title="Arrastar para reordenar"
+          style={{ fontSize: 14, color: '#C8CDD3', cursor: 'grab', userSelect: 'none',
+            lineHeight: 1, flexShrink: 0, opacity: hov ? 1 : 0, transition: 'opacity 0.15s' }}>⠿</span>
+        <EditText value={section.name} placeholder="NOME DA SEÇÃO" oneLine
+          onChange={v => upd({ name: v.toUpperCase() })}
+          style={{ fontSize: 10, fontWeight: 700, letterSpacing: 1.3, color: '#8A9099' }} />
+        <div style={{ display: 'flex', gap: 4, opacity: hov ? 1 : 0, transition: 'opacity 0.15s' }}>
+          <button onClick={onAddItem}
+            style={{ fontSize: 10, color: TEAL, border: `1px solid ${TEAL}`, borderRadius: 3, padding: '1px 8px' }}>
+            + item
+          </button>
+          <button onClick={() => { if (window.confirm('Remover esta seção?')) onDelete(); }}
+            style={{ fontSize: 10, color: '#B0B5BC', border: '1px solid #DDDFE2', borderRadius: 3, padding: '1px 8px' }}>
+            × seção
+          </button>
+        </div>
+      </div>
+      {section.items.map(item => (
+        <ItemRow key={item.id} item={item} maxDays={maxDays}
+          onUpdate={u => updateItem(item.id, u)} onDelete={() => deleteItem(item.id)} />
+      ))}
+      {section.items.length === 0 && (
+        <div style={{ padding: '12px 14px', fontSize: 12, color: '#C0C4CA' }}>
+          Seção vazia — <span onClick={onAddItem} style={{ color: TEAL, cursor: 'pointer', textDecoration: 'underline' }}>adicionar item</span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ─── GanttBar ─────────────────────────────────────────────────── */
+function GanttBar({ item, resolvedStart, onUpdateWeekStart }) {
+  const [dragDx, setDragDx] = useState(0);
+  const [dragging, setDragging] = useState(false);
+  const startRef = useRef({ x: 0, week: 0 });
+
+  const isDone   = item.status === 'done';
+  const isActive = item.status === 'in-progress';
+  /* minimum 36px so even 0.5d fits the label comfortably */
+  const dur  = (item.demoDays || 1) / 5;
+  const wPx  = Math.max(36, dur * WW - 4);
+  /* for narrow bars use smaller centered font, for wide bars larger left-aligned */
+  const narrow = wPx < 52;
+
+  const onMouseDown = e => {
+    e.preventDefault();
+    e.stopPropagation();
+    startRef.current = { x: e.clientX, week: resolvedStart };
+    setDragging(true);
+    const onMove = ev => setDragDx(ev.clientX - startRef.current.x);
+    const onUp = ev => {
+      const dw = (ev.clientX - startRef.current.x) / WW;
+      const snapped = Math.max(0, Math.round((startRef.current.week + dw) * 2) / 2);
+      onUpdateWeekStart(snapped);
+      setDragDx(0);
+      setDragging(false);
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    };
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+  };
+
+  const left = Math.max(0, resolvedStart * WW + dragDx);
+  const bg   = isDone ? '#C8CDD3' : isActive ? TEAL : '#3DCCC6';
+  const textColor = isDone ? '#9BA0A8' : '#fff';
+
+  return (
+    <div onMouseDown={onMouseDown}
+      title={`${item.title} · ${item.demoDays}d — arrastar para reposicionar`}
+      style={{
+        position: 'absolute', left, top: '50%', transform: 'translateY(-50%)',
+        width: wPx, height: 26, borderRadius: 5, background: bg,
+        cursor: dragging ? 'grabbing' : 'grab',
+        display: 'flex', alignItems: 'center',
+        justifyContent: narrow ? 'center' : 'flex-start',
+        paddingLeft: narrow ? 0 : 8,
+        userSelect: 'none', zIndex: dragging ? 20 : 2,
+        boxShadow: dragging ? `0 6px 18px ${TEAL}44` : 'none',
+        transition: dragging ? 'none' : 'box-shadow 0.15s',
+      }}>
+      <span style={{ fontSize: narrow ? 9 : 10, fontWeight: 700, color: textColor,
+        whiteSpace: 'nowrap', letterSpacing: 0.2 }}>
+        {item.demoDays}d
+      </span>
+    </div>
+  );
+}
+
+/* ─── helpers de data ─────────────────────────────────────────── */
+const getThisMonday = () => {
+  const d = new Date(); const day = d.getDay();
+  d.setDate(d.getDate() - (day === 0 ? 6 : day - 1));
+  return d.toISOString().split('T')[0];
+};
+const weekDateLabel = (sd, idx) => {
+  const d = new Date(sd + 'T00:00:00'); d.setDate(d.getDate() + idx * 7);
+  const f = new Date(d); f.setDate(f.getDate() + 4);
+  const mo = d.toLocaleString('pt-BR', { month: 'short' }).replace('.','');
+  const mf = f.toLocaleString('pt-BR', { month: 'short' }).replace('.','');
+  return d.getMonth() === f.getMonth() ? `${d.getDate()}–${f.getDate()} ${mo}` : `${d.getDate()} ${mo}–${f.getDate()} ${mf}`;
+};
+
+/* ─── GanttView ────────────────────────────────────────────────── */
+function GanttView({ data, onUpdateItemById, onUpdateStartDate, snapshotAndSetWeekStart }) {
+  const startDate = data.startDate || getThisMonday();
+  /* compute resolved positions — null weekStart = auto-sequence */
+  const posMap = useMemo(() => {
+    const m = {};
+    let cursor = 0;
+    data.sections.forEach(s => s.items.forEach(i => {
+      const rs  = i.weekStart != null ? i.weekStart : cursor;
+      const dur = Math.max(0.2, (i.demoDays || 1) / 5);
+      cursor = rs + dur;
+      m[i.id] = rs;
+    }));
+    return m;
+  }, [data]);
+
+  const totalWeeks = useMemo(() => {
+    let maxEnd = 6;
+    data.sections.forEach(s => s.items.forEach(i => {
+      const rs  = posMap[i.id] ?? 0;
+      const dur = Math.max(0.2, (i.demoDays || 1) / 5);
+      maxEnd = Math.max(maxEnd, rs + dur);
+    }));
+    return Math.ceil(maxEnd) + 3;
+  }, [data, posMap]);
+
+  const gridW = totalWeeks * WW;
+  const stripe = i => i % 2 === 0 ? 'transparent' : 'rgba(0,0,0,0.018)';
+
+  /* month groupings */
+  const monthGroups = useMemo(() => {
+    const groups = []; let cur = null;
+    for (let i = 0; i < totalWeeks; i++) {
+      const d = new Date(startDate + 'T00:00:00'); d.setDate(d.getDate() + i * 7);
+      const key = `${d.getFullYear()}-${d.getMonth()}`;
+      const raw = d.toLocaleString('pt-BR', { month: 'long' });
+      const label = raw.charAt(0).toUpperCase() + raw.slice(1) + ' ' + d.getFullYear();
+      if (!cur || cur.key !== key) { cur = { key, label, startIdx: i, endIdx: i }; groups.push(cur); }
+      else cur.endIdx = i;
+    }
+    return groups;
+  }, [startDate, totalWeeks]);
+
+  return (
+    <div className="gantt-scroll">
+      <div style={{ minWidth: LW + gridW }}>
+
+        {/* month header */}
+        <div style={{ display: 'flex', height: 26, background: '#F2F4F6', borderBottom: '1px solid #DDE0E5' }}>
+          <div style={{ width: LW, flexShrink: 0, display: 'flex', alignItems: 'center',
+            paddingLeft: 14, gap: 6, borderRight: '1px solid #DDE0E5' }}>
+            <span style={{ fontSize: 9, fontWeight: 700, letterSpacing: 0.8, color: '#C0C4CA' }}>INÍCIO</span>
+            <input type="date" value={startDate} onChange={e => onUpdateStartDate(e.target.value)}
+              style={{ fontSize: 10, color: '#6B7280', border: 'none', background: 'transparent',
+                outline: 'none', cursor: 'pointer', fontFamily: 'inherit', padding: 0 }} />
+          </div>
+          <div style={{ position: 'relative', flex: 1 }}>
+            {monthGroups.map(g => (
+              <div key={g.key} style={{ position: 'absolute',
+                left: g.startIdx * WW, width: (g.endIdx - g.startIdx + 1) * WW,
+                top: 0, bottom: 0, display: 'flex', alignItems: 'center', paddingLeft: 10,
+                borderLeft: g.startIdx > 0 ? '2px solid #C8CDD3' : 'none',
+                fontSize: 10, fontWeight: 700, color: '#6B7280', letterSpacing: 0.5,
+                overflow: 'hidden', whiteSpace: 'nowrap' }}>
+                {g.label}
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {/* week header */}
+        <div style={{ display: 'flex', height: 38, background: '#FAFAF9', borderBottom: '2px solid #ECEEF0' }}>
+          <div style={{ width: LW, flexShrink: 0, display: 'flex', alignItems: 'center', paddingLeft: 14 }}>
+            <span style={{ fontSize: 9, fontWeight: 700, letterSpacing: 1.2, color: '#B8BDC5' }}>FEATURE</span>
+          </div>
+          {Array.from({ length: totalWeeks }, (_, i) => (
+            <div key={i} style={{ width: WW, flexShrink: 0, display: 'flex', flexDirection: 'column',
+              alignItems: 'center', justifyContent: 'center', gap: 1, borderLeft: '1px solid #ECEEF0' }}>
+              <span style={{ fontSize: 10, fontWeight: 600, color: '#9BA0A8', letterSpacing: 0.3 }}>Sem {i + 1}</span>
+              <span style={{ fontSize: 8, color: '#C0C4CA' }}>{weekDateLabel(startDate, i)}</span>
+            </div>
+          ))}
+        </div>
+
+        {/* sections */}
+        {data.sections.map(section => (
+          <div key={section.id}>
+
+            {/* section label */}
+            <div style={{ display: 'flex', height: 28, background: '#F7F8F9',
+              borderTop: '1px solid #ECEEF0', borderBottom: '1px solid #ECEEF0' }}>
+              <div style={{ width: LW, flexShrink: 0, paddingLeft: 14, display: 'flex', alignItems: 'center' }}>
+                <span style={{ fontSize: 9, fontWeight: 700, letterSpacing: 1.2, color: '#8A9099' }}>{section.name}</span>
+              </div>
+              <div style={{ flex: 1, position: 'relative', overflow: 'hidden' }}>
+                {Array.from({ length: totalWeeks }, (_, i) => (
+                  <div key={i} style={{ position: 'absolute', left: i * WW, top: 0, bottom: 0,
+                    width: WW, background: stripe(i), borderLeft: '1px solid #ECEEF0' }} />
+                ))}
+              </div>
+            </div>
+
+            {section.items.length === 0 && (
+              <div style={{ display: 'flex', height: 40, borderBottom: '1px solid #F2F3F5' }}>
+                <div style={{ width: LW, flexShrink: 0, paddingLeft: 14, display: 'flex', alignItems: 'center' }}>
+                  <span style={{ fontSize: 11, color: '#D0D4D9' }}>Seção vazia</span>
+                </div>
+              </div>
+            )}
+
+            {section.items.map(item => {
+              const rs     = posMap[item.id] ?? 0;
+              const isDone = item.status === 'done';
+              return (
+                <div key={item.id} style={{ display: 'flex', minHeight: 46, alignItems: 'stretch',
+                  borderBottom: '1px solid #F2F3F5', background: '#fff' }}>
+                  {/* label */}
+                  <div style={{ width: LW, flexShrink: 0, paddingLeft: 14, paddingRight: 10,
+                    paddingTop: 8, paddingBottom: 8,
+                    display: 'flex', flexDirection: 'column', justifyContent: 'center' }}>
+                    <span style={{ fontSize: 13, fontWeight: isDone ? 400 : 500,
+                      color: isDone ? '#B8BDC5' : '#1c1c1e',
+                      lineHeight: 1.35, textWrap: 'pretty', wordBreak: 'break-word' }}>
+                      {item.title}
+                    </span>
+                    {item.subtitle && (
+                      <span style={{ fontSize: 10, color: '#C0C4CA', marginTop: 2,
+                        lineHeight: 1.3, textWrap: 'pretty', wordBreak: 'break-word' }}>
+                        {item.subtitle}
+                      </span>
+                    )}
+                  </div>
+                  {/* grid + bar */}
+                  <div style={{ flex: 1, position: 'relative' }}>
+                    {Array.from({ length: totalWeeks }, (_, i) => (
+                      <div key={i} style={{ position: 'absolute', left: i * WW, top: 0, bottom: 0,
+                        width: WW, background: i % 2 === 0 ? '#fff' : '#FAFAF9',
+                        borderLeft: '1px solid #F0F1F3' }} />
+                    ))}
+                    <GanttBar
+                      item={item}
+                      resolvedStart={rs}
+                      onUpdateWeekStart={w => snapshotAndSetWeekStart(item.id, w)}
+                    />
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        ))}
+
+        {/* hint bar */}
+        <div style={{ padding: '10px 14px', fontSize: 11, color: '#C8CDD3',
+          background: '#FAFAF9', borderTop: '1px solid #ECEEF0', display: 'flex', gap: 20 }}>
+          <span>⟵ arraste as barras para reposicionar</span>
+          <span>snap: ½ semana (2,5 dias)</span>
+          <span>comprimento = dias de demo</span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ─── LoginScreen ──────────────────────────────────────────────── */
+function LoginScreen({ onSignIn, loading, error }) {
+  return (
+    <div style={{ minHeight: '100vh', background: '#EFEDE8', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+      <div style={{ background: '#fff', borderRadius: 16, padding: '48px 40px', textAlign: 'center',
+        boxShadow: '0 4px 32px rgba(0,0,0,0.08)', maxWidth: 340, width: '100%' }}>
+        <img src="data:image/png;base64,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" alt="Dock" style={{ width: 72, height: 72, borderRadius: 16, margin: '0 auto 20px', display: 'block' }} />
+        <h1 style={{ fontSize: 22, fontWeight: 800, color: '#1c1c1e', letterSpacing: -0.5, marginBottom: 6 }}>Cronograma DockBank</h1>
+        <p style={{ fontSize: 13, color: '#9BA0A8', marginBottom: error ? 16 : 32, lineHeight: 1.5 }}>Acesso restrito ao time interno</p>
+        {error && (
+          <div style={{ background: '#FEF2F2', border: '1px solid #FECACA', borderRadius: 8,
+            padding: '10px 14px', marginBottom: 20, fontSize: 12, color: '#DC2626', lineHeight: 1.5 }}>
+            {error}
+          </div>
+        )}
+        <button onClick={onSignIn} disabled={loading}
+          style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10, width: '100%',
+            background: '#fff', border: '1.5px solid #DDDFE2', borderRadius: 8, padding: '12px 20px',
+            fontSize: 14, fontWeight: 500, color: '#1c1c1e',
+            cursor: loading ? 'not-allowed' : 'pointer', opacity: loading ? 0.6 : 1 }}>
+          <svg width="18" height="18" viewBox="0 0 18 18" fill="none">
+            <path d="M17.64 9.2c0-.637-.057-1.251-.164-1.84H9v3.481h4.844c-.209 1.125-.843 2.078-1.796 2.717v2.258h2.908C16.658 14.013 17.64 11.705 17.64 9.2z" fill="#4285F4"/>
+            <path d="M9 18c2.43 0 4.467-.806 5.956-2.18l-2.908-2.259c-.806.54-1.837.86-3.048.86-2.344 0-4.328-1.584-5.036-3.711H.957v2.332A8.997 8.997 0 009 18z" fill="#34A853"/>
+            <path d="M3.964 10.71c-.18-.54-.282-1.117-.282-1.71s.102-1.17.282-1.71V4.958H.957A8.996 8.996 0 000 9c0 1.452.348 2.827.957 4.042l3.007-2.332z" fill="#FBBC05"/>
+            <path d="M9 3.58c1.321 0 2.508.454 3.44 1.345l2.582-2.58C13.463.891 11.426 0 9 0A8.997 8.997 0 00.957 4.958L3.964 6.29C4.672 4.163 6.656 3.58 9 3.58z" fill="#EA4335"/>
+          </svg>
+          {loading ? 'Entrando...' : 'Entrar com Google'}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/* ─── App ──────────────────────────────────────────────────────── */
+function App() {
+  const [tab,           setTab]           = useState('list');
+  const [user,          setUser]          = useState(null);
+  const [authLoading,   setAuthLoading]   = useState(true);
+  const [signInLoading, setSignInLoading] = useState(false);
+  const [authError,     setAuthError]     = useState('');
+  const [tabs,          setTabs]          = useState(() => makeDefault());
+  const [activeTabId,   setActiveTabId]   = useState(null);
+  const [actLog,        setActLog]        = useState([]);
+  const isRemoteRef     = useRef(false);
+  const writeTimerRef   = useRef(null);
+  const initializedRef  = useRef(false); // impede write antes do 1º snapshot carregar
+
+  /* derived: aba ativa */
+  const resolvedTabId = activeTabId ?? tabs[0]?.id;
+  const activeData    = tabs.find(t => t.id === resolvedTabId) ?? tabs[0] ?? makeDefaultTab();
+
+  /* auth — verifica allowlist após login com Google */
+  useEffect(() => {
+    return fbAuth.onAuthStateChanged(async u => {
+      if (u) {
+        if (!isAllowed(u.email)) {
+          await fbAuth.signOut();
+          setAuthError(`Acesso não autorizado para ${u.email}. Use sua conta @dock.tech.`);
+          setUser(null);
+        } else {
+          setAuthError('');
+          setUser(u);
+        }
+      } else {
+        setUser(null);
+      }
+      setAuthLoading(false);
+    });
+  }, []);
+
+  /* Firestore data sync */
+  useEffect(() => {
+    if (!user) { initializedRef.current = false; return; }
+    const doc = fbDb.collection('timeline').doc('main');
+    const unsub = doc.onSnapshot(snap => {
+      if (!snap.exists) {
+        const initial = makeDefault();
+        setTabs(initial);
+        setActiveTabId(initial[0].id);
+        doc.set({ tabs: initial, _c: MY_CLIENT });
+        initializedRef.current = true;
+      } else {
+        const remote = snap.data();
+        initializedRef.current = true; // sempre marca após 1º snapshot
+        if (remote._c !== MY_CLIENT) {
+          isRemoteRef.current = true;
+          const { _c, ...clean } = remote;
+          /* migração: formato antigo tinha sections/title na raiz */
+          if (clean.sections && !clean.tabs) {
+            const migrated = [{ id: uid(), name: clean.title || 'Cronograma DockBank', startDate: clean.startDate, sections: clean.sections }];
+            setTabs(migrated);
+            setActiveTabId(migrated[0].id);
+          } else {
+            const loaded = clean.tabs || makeDefault();
+            setTabs(loaded);
+            setActiveTabId(prev => (prev && loaded.find(t => t.id === prev)) ? prev : loaded[0]?.id ?? null);
+          }
+        }
+      }
+    });
+    const unsubLog = doc.collection('log').orderBy('ts', 'desc').limit(300)
+      .onSnapshot(snap => setActLog(snap.docs.map(d => ({ id: d.id, ...d.data() }))));
+    return () => { unsub(); unsubLog(); };
+  }, [user]);
+
+  /* write to Firestore debounced 800ms */
+  useEffect(() => {
+    if (!user) return;
+    if (!initializedRef.current) return; // aguarda o 1º snapshot antes de escrever
+    clearTimeout(writeTimerRef.current);  // sempre cancela timer pendente primeiro
+    if (isRemoteRef.current) { isRemoteRef.current = false; return; }
+    writeTimerRef.current = setTimeout(() => {
+      fbDb.collection('timeline').doc('main').set({ tabs, _c: MY_CLIENT });
+    }, 800);
+  }, [tabs, user]);
+
+  const logIt = useCallback((action) => {
+    if (!user) return;
+    fbDb.collection('timeline').doc('main').collection('log').add({
+      ts: Date.now(), user: user.displayName || user.email || 'Anônimo', userId: user.uid, action
+    });
+  }, [user]);
+
+  const signIn  = async () => { setSignInLoading(true); try { await fbAuth.signInWithPopup(googleProvider); } catch(e) { console.error(e); } setSignInLoading(false); };
+  const signOut = () => fbAuth.signOut();
+
+  /* ── gerenciamento de abas ── */
+  const updateActiveTab = useCallback(updater =>
+    setTabs(prev => prev.map(t => t.id === resolvedTabId ? updater(t) : t))
+  , [resolvedTabId]);
+
+  const addTab = () => {
+    const t = makeDefaultTab('Nova timeline');
+    setTabs(prev => [...prev, t]);
+    setActiveTabId(t.id);
+    setTab('list');
+    logIt('Nova aba criada');
+  };
+  const deleteTab = tabId => {
+    const name = tabs.find(t => t.id === tabId)?.name || '';
+    if (!window.confirm(`Remover a aba "${name}"?`)) return;
+    setTabs(prev => {
+      const rest = prev.filter(t => t.id !== tabId);
+      if (activeTabId === tabId) setActiveTabId(rest[0]?.id ?? null);
+      return rest;
+    });
+    logIt(`Aba "${name}" removida`);
+  };
+  const renameTab = (tabId, name) =>
+    setTabs(prev => prev.map(t => t.id === tabId ? { ...t, name } : t));
+
+  /* ── helpers de dados (operam na aba ativa) ── */
+  const maxDays = useMemo(() => {
+    let m = 1;
+    (activeData?.sections || []).forEach(s => s.items.forEach(i => { if ((i.demoDays || 0) > m) m = i.demoDays; }));
+    return m;
+  }, [activeData]);
+
+  const totals = useMemo(() => {
+    let demo = 0, api = 0;
+    (activeData?.sections || []).forEach(s => s.items.forEach(i => {
+      if (i.status !== 'done') { demo += i.demoDays || 0; api += i.apiDays || 0; }
+    }));
+    const r = x => Math.round(x * 2) / 2;
+    const w = x => Math.round(x / 5 * 2) / 2;
+    return { demo: r(demo), api: r(api), total: r(demo + api), demoW: w(demo), totalW: w(demo + api) };
+  }, [activeData]);
+
+  const [dragSectionId, setDragSectionId] = useState(null);
+  const [dropSectionId, setDropSectionId] = useState(null);
+
+  const moveSectionTo = (fromId, toId) => {
+    updateActiveTab(t => {
+      const secs = [...t.sections];
+      const fi = secs.findIndex(s => s.id === fromId);
+      const ti = secs.findIndex(s => s.id === toId);
+      if (fi === -1 || ti === -1 || fi === ti) return t;
+      const fromName = secs[fi].name;
+      const [moved] = secs.splice(fi, 1);
+      secs.splice(ti, 0, moved);
+      logIt(`Seção "${fromName}" reordenada`);
+      return { ...t, sections: secs };
+    });
+  };
+
+  const updateSection = (id, u) => {
+    updateActiveTab(t => {
+      const old = t.sections.find(s => s.id === id);
+      if (old) {
+        if (old.name !== u.name) logIt(`Seção renomeada: "${old.name}" → "${u.name}"`);
+        old.items.forEach(oi => {
+          const ni = u.items.find(i => i.id === oi.id);
+          if (!ni) { logIt(`Item removido: "${oi.title}"`); return; }
+          if (oi.status !== ni.status) logIt(`"${oi.title}": ${STATUS[oi.status].label} → ${STATUS[ni.status].label}`);
+          if (oi.title !== ni.title)   logIt(`Renomeado: "${oi.title}" → "${ni.title}"`);
+          if (oi.demoDays !== ni.demoDays) logIt(`Dias: "${ni.title}" ${oi.demoDays}d → ${ni.demoDays}d`);
+        });
+        u.items.forEach(ni => { if (!old.items.find(oi => oi.id === ni.id)) logIt(`Item adicionado: "${ni.title}"`); });
+      }
+      return { ...t, sections: t.sections.map(s => s.id === id ? u : s) };
+    });
+  };
+  const deleteSection  = id  => updateActiveTab(t => { const s = t.sections.find(x => x.id === id); if(s) logIt(`Seção removida: "${s.name}"`); return { ...t, sections: t.sections.filter(s => s.id !== id) }; });
+  const addSection     = ()  => { logIt('Nova seção criada'); updateActiveTab(t => ({ ...t, sections: [...t.sections, { id: uid(), name: 'NOVA SEÇÃO', items: [] }] })); };
+  const addItem        = secId => updateActiveTab(t => ({
+    ...t, sections: t.sections.map(s => s.id !== secId ? s : {
+      ...s, items: [...s.items, { id: uid(), title: 'Nova feature', subtitle: '', status: 'pending', demoDays: 1, apiDays: 0.5 }]
+    })
+  }));
+  const updateItemById = useCallback((id, patch) =>
+    setTabs(prev => prev.map(t => t.id !== resolvedTabId ? t : {
+      ...t, sections: t.sections.map(s => ({ ...s, items: s.items.map(i => i.id === id ? { ...i, ...patch } : i) }))
+    }))
+  , [resolvedTabId]);
+
+  const snapshotAndSetWeekStart = useCallback((itemId, newWeek) => {
+    setTabs(prev => prev.map(t => {
+      if (t.id !== resolvedTabId) return t;
+      const pos = {}; let cur = 0;
+      t.sections.forEach(s => s.items.forEach(i => {
+        const rs = i.weekStart != null ? i.weekStart : cur;
+        const du = Math.max(0.2, (i.demoDays || 1) / 5);
+        cur = rs + du; pos[i.id] = rs;
+      }));
+      const name = t.sections.flatMap(s => s.items).find(i => i.id === itemId)?.title || '';
+      logIt(`Barra "${name}" movida para Sem ${Math.floor(newWeek) + 1}`);
+      return {
+        ...t,
+        sections: t.sections.map(s => ({
+          ...s,
+          items: s.items.map(i => ({
+            ...i,
+            weekStart: i.id === itemId ? newWeek : (i.weekStart ?? pos[i.id] ?? 0)
+          }))
+        }))
+      };
+    }));
+  }, [resolvedTabId, logIt]);
+
+  const resetPositions = () => updateActiveTab(t => ({
+    ...t, sections: t.sections.map(s => ({ ...s, items: s.items.map(i => ({ ...i, weekStart: null })) }))
+  }));
+
+  if (authLoading) return (
+    <div style={{ minHeight: '100vh', background: '#EFEDE8', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+      <span style={{ fontSize: 14, color: '#9BA0A8' }}>Carregando…</span>
+    </div>
+  );
+  if (!user) return <LoginScreen onSignIn={signIn} loading={signInLoading} error={authError} />;
+
+  const COLS = '230px 1fr 108px 80px 72px';
+
+  const LEGEND = [
+    { c: GRAY_BAR,   l: 'Concluído' },
+    { c: '#3DCCC6',  l: 'Pendente'  },
+    { c: TEAL,       l: 'Andamento' },
+  ];
+
+  return (
+    <div style={{ minHeight: '100vh', background: '#EFEDE8', padding: '40px 24px 80px' }}>
+      <div style={{ maxWidth: 1080, margin: '0 auto' }}>
+        <div style={{ background: '#fff', borderRadius: 14, boxShadow: '0 2px 24px rgba(0,0,0,0.07)', overflow: 'hidden' }}>
+
+          {/* ── header ── */}
+          <div style={{ padding: '16px 28px', borderBottom: '1px solid #ECEEF0' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 16, flexWrap: 'wrap' }}>
+
+              {/* ── workspace tabs ── */}
+              <div style={{ display: 'flex', alignItems: 'center', gap: 3, flexWrap: 'wrap', minWidth: 0, flex: 1 }}>
+                {tabs.map(t => {
+                  const isActive = t.id === resolvedTabId;
+                  return (
+                    <div key={t.id} onClick={() => setActiveTabId(t.id)}
+                      style={{ display: 'flex', alignItems: 'center', gap: 5,
+                        padding: '6px 10px 6px 12px', borderRadius: 8, cursor: 'pointer',
+                        background: isActive ? '#F2F3F5' : 'transparent',
+                        border: `1px solid ${isActive ? '#E4E6EA' : 'transparent'}`,
+                        transition: 'all 0.12s', maxWidth: 220 }}>
+                      {isActive ? (
+                        <EditText value={t.name} oneLine onChange={v => renameTab(t.id, v)}
+                          style={{ fontSize: 14, fontWeight: 700, color: '#1c1c1e', letterSpacing: -0.3 }} />
+                      ) : (
+                        <span style={{ fontSize: 13, fontWeight: 500, color: '#9BA0A8',
+                          whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', maxWidth: 170 }}>
+                          {t.name}
+                        </span>
+                      )}
+                      {tabs.length > 1 && (
+                        <button onClick={e => { e.stopPropagation(); deleteTab(t.id); }}
+                          style={{ fontSize: 14, lineHeight: 1, padding: '0 2px', flexShrink: 0,
+                            color: isActive ? '#C0C4CA' : 'transparent', transition: 'color 0.1s' }}>×</button>
+                      )}
+                    </div>
+                  );
+                })}
+                <button onClick={addTab}
+                  style={{ width: 28, height: 28, borderRadius: 7, border: `1.5px dashed ${TEAL}`,
+                    color: TEAL, fontSize: 18, display: 'flex', alignItems: 'center', justifyContent: 'center',
+                    flexShrink: 0, lineHeight: 1 }}>+</button>
+              </div>
+
+              <div style={{ display: 'flex', alignItems: 'center', gap: 16, flexShrink: 0 }}>
+                {/* legend */}
+                <div style={{ display: 'flex', gap: 12, alignItems: 'center' }}>
+                  {LEGEND.map(({ c, l }) => (
+                    <div key={l} style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
+                      <div style={{ width: 10, height: 4, borderRadius: 2, background: c }} />
+                      <span style={{ fontSize: 11, color: '#9BA0A8' }}>{l}</span>
+                    </div>
+                  ))}
+                </div>
+                {/* view toggle */}
+                <div style={{ display: 'flex', background: '#F2F3F5', borderRadius: 8, padding: 3, gap: 2 }}>
+                  {[['list', 'Lista'], ['gantt', 'Gantt'], ['history', 'Histórico']].map(([t, l]) => (
+                    <button key={t} onClick={() => setTab(t)}
+                      style={{ fontSize: 12, fontWeight: 600, padding: '5px 18px', borderRadius: 6,
+                        background: tab === t ? '#fff' : 'transparent',
+                        color: tab === t ? '#1c1c1e' : '#9BA0A8',
+                        boxShadow: tab === t ? '0 1px 4px rgba(0,0,0,0.1)' : 'none',
+                        transition: 'all 0.15s' }}>
+                      {l}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </div>
+            <div style={{ marginTop: 10, display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+              <p style={{ fontSize: 11, color: '#C0C4CA' }}>
+                {tab === 'list'    ? 'Clique em qualquer texto para editar · Clique no status para alternar · Hover para excluir'
+                : tab === 'gantt'  ? 'Arraste as barras para reposicionar · Snap ½ semana · Edite nomes e dias na aba Lista'
+                :                   'Registro de alterações — todas as mudanças são salvas automaticamente'}
+              </p>
+              {/* user info */}
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0 }}>
+                {user.photoURL
+                  ? <img src={user.photoURL} alt="" style={{ width: 26, height: 26, borderRadius: 13 }} />
+                  : <div style={{ width: 26, height: 26, borderRadius: 13, background: TEAL, flexShrink: 0,
+                      display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 11, fontWeight: 700, color: '#fff' }}>
+                      {(user.displayName || user.email || '?')[0].toUpperCase()}
+                    </div>
+                }
+                <span style={{ fontSize: 11, color: '#6B7280', maxWidth: 130, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  {user.displayName || user.email}
+                </span>
+                <button onClick={signOut}
+                  style={{ fontSize: 10, color: '#9BA0A8', border: '1px solid #DDDFE2', borderRadius: 4, padding: '3px 8px' }}>
+                  Sair
+                </button>
+              </div>
+            </div>
+          </div>
+
+          {/* ── lista ── */}
+          {tab === 'list' && (
+            <>
+              <div style={{ display: 'grid', gridTemplateColumns: COLS, padding: '7px 0',
+                background: '#FAFAF9', borderBottom: '1px solid #ECEEF0' }}>
+                {[{ l: 'FEATURE', a: 'left', pl: 17 }, { l: 'ESFORÇO VISUAL', a: 'center' },
+                  { l: 'STATUS', a: 'center' }, { l: 'DEMO', a: 'right', pr: 8 }, { l: '+ API', a: 'right', pr: 12 }]
+                  .map(({ l, a, pl = 0, pr = 0 }) => (
+                    <div key={l} style={{ fontSize: 9, fontWeight: 700, letterSpacing: 1.2, color: '#B8BDC5',
+                      textAlign: a, paddingLeft: pl, paddingRight: pr }}>{l}</div>
+                  ))}
+              </div>
+              {(activeData?.sections || []).map(s => (
+                <SectionBlock key={s.id} section={s} maxDays={maxDays}
+                  onUpdate={u => updateSection(s.id, u)}
+                  onDelete={() => deleteSection(s.id)}
+                  onAddItem={() => addItem(s.id)}
+                  onDragStart={() => setDragSectionId(s.id)}
+                  onDragOver={() => { if (dragSectionId && dragSectionId !== s.id) setDropSectionId(s.id); }}
+                  onDrop={() => { if (dragSectionId) moveSectionTo(dragSectionId, s.id); setDragSectionId(null); setDropSectionId(null); }}
+                  onDragEnd={() => { setDragSectionId(null); setDropSectionId(null); }}
+                  isDragging={dragSectionId === s.id}
+                  isDropTarget={dropSectionId === s.id && dragSectionId !== s.id}
+                />
+              ))}
+              {/* total row */}
+              <div style={{ display: 'grid', gridTemplateColumns: COLS, alignItems: 'center', height: 52,
+                borderTop: '2px solid #1c1c1e', background: '#FAFAF9' }}>
+                <div style={{ paddingLeft: 17, fontSize: 12, fontWeight: 700, letterSpacing: 0.5, color: '#5A5F68' }}>TOTAL PENDENTES</div>
+                <div style={{ padding: '0 20px' }}>
+                  <div style={{ height: 5, borderRadius: 3, background: '#E8EAED', overflow: 'hidden' }}>
+                    <div style={{ width: `${Math.min(100, (totals.demo / maxDays) * 100)}%`, height: '100%', background: TEAL, borderRadius: 3 }} />
+                  </div>
+                </div>
+                <div />
+                <div style={{ textAlign: 'right', paddingRight: 8, fontSize: 17, fontWeight: 800, color: TEAL, fontVariantNumeric: 'tabular-nums' }}>~{totals.demo}d</div>
+                <div style={{ textAlign: 'right', paddingRight: 12, fontSize: 14, fontWeight: 600, color: '#6B7280', fontVariantNumeric: 'tabular-nums' }}>+{totals.api}d</div>
+              </div>
+            </>
+          )}
+
+          {/* ── histórico ── */}
+          {tab === 'history' && (
+            <div style={{ padding: '20px 24px 8px' }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
+                <span style={{ fontSize: 12, color: '#9BA0A8' }}>{actLog.length} alterações registradas</span>
+                <button onClick={() => {
+                  const batch = fbDb.batch();
+                  actLog.forEach(e => batch.delete(fbDb.collection('timeline').doc('main').collection('log').doc(e.id)));
+                  batch.commit().catch(console.error);
+                }} style={{ fontSize: 11, color: '#C0C4CA', padding: '2px 8px' }}>Limpar</button>
+              </div>
+              {actLog.length === 0 && (
+                <p style={{ fontSize: 13, color: '#C0C4CA', padding: '20px 0' }}>Nenhuma alteração ainda — edite algo na aba Lista ou Gantt.</p>
+              )}
+              {actLog.map(e => (
+                <div key={e.id} style={{ display: 'flex', gap: 10, alignItems: 'flex-start',
+                  padding: '9px 0', borderBottom: '1px solid #F2F3F5' }}>
+                  <div style={{ width: 28, height: 28, borderRadius: 14, background: TEAL, flexShrink: 0,
+                    display: 'flex', alignItems: 'center', justifyContent: 'center',
+                    fontSize: 11, fontWeight: 800, color: '#fff', letterSpacing: -0.3 }}>
+                    {(e.user || '?')[0].toUpperCase()}
+                  </div>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <span style={{ fontSize: 12, fontWeight: 600, color: '#1c1c1e' }}>{e.user}</span>
+                    <span style={{ fontSize: 12, color: '#6B7280' }}> · {e.action}</span>
+                    <div style={{ fontSize: 10, color: '#C0C4CA', marginTop: 2 }}>{formatTs(e.ts)}</div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* ── gantt ── */}
+          {tab === 'gantt' && <GanttView data={activeData} onUpdateItemById={updateItemById}
+            onUpdateStartDate={d => updateActiveTab(t => ({ ...t, startDate: d }))}
+            snapshotAndSetWeekStart={snapshotAndSetWeekStart} />}
+
+          {/* ── summary cards (ambas as abas) ── */}
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', borderTop: '1px solid #ECEEF0' }}>
+            {[
+              { l: 'DEMO MOCKADO',   v: `~${totals.demo}d`,  s: `~${totals.demoW} semanas`  },
+              { l: '+ API REAL',     v: `~${totals.api}d`,   s: 'quando APIs prontas'        },
+              { l: 'TOTAL MVP PROD', v: `~${totals.total}d`, s: `~${totals.totalW} semanas`  },
+            ].map(({ l, v, s }, i) => (
+              <div key={l} style={{ padding: '24px 0', textAlign: 'center', borderRight: i < 2 ? '1px solid #ECEEF0' : 'none' }}>
+                <div style={{ fontSize: 9, fontWeight: 700, letterSpacing: 1.3, color: '#B8BDC5', marginBottom: 8 }}>{l}</div>
+                <div style={{ fontSize: 30, fontWeight: 800, color: '#1c1c1e', letterSpacing: -1, fontVariantNumeric: 'tabular-nums' }}>{v}</div>
+                <div style={{ fontSize: 11, color: '#B8BDC5', marginTop: 5 }}>{s}</div>
+              </div>
+            ))}
+          </div>
+
+          {/* ── footer ── */}
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+            padding: '18px 20px', borderTop: '1px solid #ECEEF0', background: '#FAFAF9' }}>
+            {tab === 'list' ? (
+              <button onClick={addSection}
+                style={{ fontSize: 12, color: TEAL, border: `1.5px dashed ${TEAL}`, borderRadius: 7, padding: '7px 20px', letterSpacing: 0.3 }}>
+                + Adicionar seção
+              </button>
+            ) : (
+              <button onClick={resetPositions}
+                style={{ fontSize: 12, color: '#8A9099', border: '1.5px solid #DDDFE2', borderRadius: 7, padding: '7px 16px' }}>
+                ↺ Resetar posições
+              </button>
+            )}
+            <button onClick={() => { if (window.confirm('Resetar esta aba para o estado inicial?')) { updateActiveTab(() => makeDefaultTab(activeData?.name || 'Feature Timeline')); } }}
+              style={{ fontSize: 11, color: '#C0C4CA', padding: '4px 8px' }}>
+              Resetar dados
+            </button>
+          </div>
+
+        </div>
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>
