@@ -566,6 +566,7 @@ function App() {
   const isRemoteRef     = useRef(false);
   const writeTimerRef   = useRef(null);
   const initializedRef  = useRef(false); // impede write antes do 1º snapshot carregar
+  const lastSnapshotRef = useRef(null);  // snapshot antes de cada ação (para restore)
 
   /* derived: aba ativa */
   const resolvedTabId = activeTabId ?? tabs[0]?.id;
@@ -620,8 +621,18 @@ function App() {
         }
       }
     });
-    const unsubLog = doc.collection('log').orderBy('ts', 'desc').limit(300)
-      .onSnapshot(snap => setActLog(snap.docs.map(d => ({ id: d.id, ...d.data() }))));
+    const unsubLog = doc.collection('log').orderBy('ts', 'desc').limit(50)
+      .onSnapshot(snap => {
+        setActLog(snap.docs.map(d => ({ id: d.id, ...d.data() })));
+        /* auto-limpeza: remove entradas com mais de 60 dias */
+        const cutoff = Date.now() - 60 * 24 * 60 * 60 * 1000;
+        const old = snap.docs.filter(d => d.data().ts < cutoff);
+        if (old.length > 0) {
+          const batch = fbDb.batch();
+          old.forEach(d => batch.delete(d.ref));
+          batch.commit().catch(console.error);
+        }
+      });
     return () => { unsub(); unsubLog(); };
   }, [user]);
 
@@ -638,8 +649,11 @@ function App() {
 
   const logIt = useCallback((action) => {
     if (!user) return;
+    const snapshot = lastSnapshotRef.current;
     fbDb.collection('timeline').doc('main').collection('log').add({
-      ts: Date.now(), user: user.displayName || user.email || 'Anônimo', userId: user.uid, action
+      ts: Date.now(), user: user.displayName || user.email || 'Anônimo',
+      userId: user.uid, action,
+      ...(snapshot ? { snapshot } : {})
     });
   }, [user]);
 
@@ -647,11 +661,13 @@ function App() {
   const signOut = () => fbAuth.signOut();
 
   /* ── gerenciamento de abas ── */
-  const updateActiveTab = useCallback(updater =>
-    setTabs(prev => prev.map(t => t.id === resolvedTabId ? updater(t) : t))
-  , [resolvedTabId]);
+  const updateActiveTab = useCallback(updater => {
+    lastSnapshotRef.current = tabs; // captura antes da mudança
+    setTabs(prev => prev.map(t => t.id === resolvedTabId ? updater(t) : t));
+  }, [resolvedTabId, tabs]);
 
   const addTab = () => {
+    lastSnapshotRef.current = tabs;
     const t = makeDefaultTab('Nova timeline');
     setTabs(prev => [...prev, t]);
     setActiveTabId(t.id);
@@ -661,6 +677,7 @@ function App() {
   const deleteTab = tabId => {
     const name = tabs.find(t => t.id === tabId)?.name || '';
     if (!window.confirm(`Remover a aba "${name}"?`)) return;
+    lastSnapshotRef.current = tabs;
     setTabs(prev => {
       const rest = prev.filter(t => t.id !== tabId);
       if (activeTabId === tabId) setActiveTabId(rest[0]?.id ?? null);
@@ -687,6 +704,19 @@ function App() {
     const w = x => Math.round(x / 5 * 2) / 2;
     return { demo: r(demo), api: r(api), total: r(demo + api), demoW: w(demo), totalW: w(demo + api) };
   }, [activeData]);
+
+  const totalsAll = useMemo(() => {
+    let demo = 0, api = 0;
+    (activeData?.sections || []).forEach(s => s.items.forEach(i => {
+      demo += i.demoDays || 0;
+      api += Math.max(0, i.apiDays || 0);
+    }));
+    const r = x => Math.round(x * 2) / 2;
+    const w = x => Math.round(x / 5 * 2) / 2;
+    const doneDays = demo - totals.demo;
+    const pctDone = demo > 0 ? Math.round((doneDays / demo) * 100) : 0;
+    return { demo: r(demo), api: r(api), total: r(demo + api), demoW: w(demo), totalW: w(demo + api), pctDone };
+  }, [activeData, totals]);
 
   const [dragSectionId, setDragSectionId] = useState(null);
   const [dropSectionId, setDropSectionId] = useState(null);
@@ -729,13 +759,15 @@ function App() {
       ...s, items: [...s.items, { id: uid(), title: 'Nova feature', subtitle: '', status: 'pending', demoDays: 1, apiDays: 0.5 }]
     })
   }));
-  const updateItemById = useCallback((id, patch) =>
+  const updateItemById = useCallback((id, patch) => {
+    lastSnapshotRef.current = tabs;
     setTabs(prev => prev.map(t => t.id !== resolvedTabId ? t : {
       ...t, sections: t.sections.map(s => ({ ...s, items: s.items.map(i => i.id === id ? { ...i, ...patch } : i) }))
-    }))
-  , [resolvedTabId]);
+    }));
+  }, [resolvedTabId, tabs]);
 
   const snapshotAndSetWeekStart = useCallback((itemId, newWeek) => {
+    lastSnapshotRef.current = tabs;
     setTabs(prev => prev.map(t => {
       if (t.id !== resolvedTabId) return t;
       const pos = {}; let cur = 0;
@@ -762,6 +794,16 @@ function App() {
   const resetPositions = () => updateActiveTab(t => ({
     ...t, sections: t.sections.map(s => ({ ...s, items: s.items.map(i => ({ ...i, weekStart: null })) }))
   }));
+
+  const restoreFromLog = (entry) => {
+    if (!entry.snapshot) return;
+    if (!window.confirm(`Restaurar para o estado anterior a:\n"${entry.action}"?\n\nO estado atual será sobrescrito.`)) return;
+    lastSnapshotRef.current = tabs;
+    const snap = entry.snapshot;
+    setTabs(snap);
+    setActiveTabId(prev => snap.find(t => t.id === prev) ? prev : snap[0]?.id ?? null);
+    logIt(`↩ Restaurado para antes de: "${entry.action}"`);
+  };
 
   if (authLoading) return (
     <div style={{ minHeight: '100vh', background: '#EFEDE8', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
@@ -897,7 +939,7 @@ function App() {
                   isDropTarget={dropSectionId === s.id && dragSectionId !== s.id}
                 />
               ))}
-              {/* total row */}
+              {/* total pendentes row */}
               <div style={{ display: 'grid', gridTemplateColumns: COLS, alignItems: 'center', height: 52,
                 borderTop: '2px solid #1c1c1e', background: '#FAFAF9' }}>
                 <div style={{ paddingLeft: 17, fontSize: 12, fontWeight: 700, letterSpacing: 0.5, color: '#5A5F68' }}>TOTAL PENDENTES</div>
@@ -909,6 +951,22 @@ function App() {
                 <div />
                 <div style={{ textAlign: 'right', paddingRight: 8, fontSize: 17, fontWeight: 800, color: TEAL, fontVariantNumeric: 'tabular-nums' }}>~{totals.demo}d</div>
                 <div style={{ textAlign: 'right', paddingRight: 12, fontSize: 14, fontWeight: 600, color: '#6B7280', fontVariantNumeric: 'tabular-nums' }}>+{totals.api}d</div>
+              </div>
+              {/* total geral row */}
+              <div style={{ display: 'grid', gridTemplateColumns: COLS, alignItems: 'center', height: 52,
+                borderTop: '1px solid #ECEEF0', background: '#F5F5F4' }}>
+                <div style={{ paddingLeft: 17 }}>
+                  <div style={{ fontSize: 12, fontWeight: 700, letterSpacing: 0.5, color: '#8A9099' }}>TOTAL GERAL</div>
+                  <div style={{ fontSize: 10, color: '#B8BDC5', marginTop: 1 }}>{totalsAll.pctDone}% concluído</div>
+                </div>
+                <div style={{ padding: '0 20px' }}>
+                  <div style={{ height: 5, borderRadius: 3, background: '#E8EAED', overflow: 'hidden', position: 'relative' }}>
+                    <div style={{ width: `${totalsAll.pctDone}%`, height: '100%', background: GRAY_BAR, borderRadius: 3, transition: 'width 0.3s' }} />
+                  </div>
+                </div>
+                <div />
+                <div style={{ textAlign: 'right', paddingRight: 8, fontSize: 17, fontWeight: 800, color: '#8A9099', fontVariantNumeric: 'tabular-nums' }}>~{totalsAll.demo}d</div>
+                <div style={{ textAlign: 'right', paddingRight: 12, fontSize: 14, fontWeight: 600, color: '#B8BDC5', fontVariantNumeric: 'tabular-nums' }}>+{totalsAll.api}d</div>
               </div>
             </>
           )}
@@ -927,19 +985,28 @@ function App() {
               {actLog.length === 0 && (
                 <p style={{ fontSize: 13, color: '#C0C4CA', padding: '20px 0' }}>Nenhuma alteração ainda — edite algo na aba Lista ou Gantt.</p>
               )}
-              {actLog.map(e => (
+              {actLog.slice(0, 50).map(e => (
                 <div key={e.id} style={{ display: 'flex', gap: 10, alignItems: 'flex-start',
                   padding: '9px 0', borderBottom: '1px solid #F2F3F5' }}>
-                  <div style={{ width: 28, height: 28, borderRadius: 14, background: TEAL, flexShrink: 0,
-                    display: 'flex', alignItems: 'center', justifyContent: 'center',
-                    fontSize: 11, fontWeight: 800, color: '#fff', letterSpacing: -0.3 }}>
-                    {(e.user || '?')[0].toUpperCase()}
+                  <div style={{ width: 28, height: 28, borderRadius: 14, background: e.action.startsWith('↩') ? '#F0F1F3' : TEAL,
+                    flexShrink: 0, display: 'flex', alignItems: 'center', justifyContent: 'center',
+                    fontSize: 11, fontWeight: 800, color: e.action.startsWith('↩') ? '#8A9099' : '#fff', letterSpacing: -0.3 }}>
+                    {e.action.startsWith('↩') ? '↩' : (e.user || '?')[0].toUpperCase()}
                   </div>
                   <div style={{ flex: 1, minWidth: 0 }}>
                     <span style={{ fontSize: 12, fontWeight: 600, color: '#1c1c1e' }}>{e.user}</span>
                     <span style={{ fontSize: 12, color: '#6B7280' }}> · {e.action}</span>
                     <div style={{ fontSize: 10, color: '#C0C4CA', marginTop: 2 }}>{formatTs(e.ts)}</div>
                   </div>
+                  {e.snapshot && !e.action.startsWith('↩') && (
+                    <button onClick={() => restoreFromLog(e)}
+                      title="Restaurar para o estado anterior a esta ação"
+                      style={{ fontSize: 11, color: '#9BA0A8', border: '1px solid #DDDFE2', borderRadius: 5,
+                        padding: '3px 8px', flexShrink: 0, whiteSpace: 'nowrap',
+                        background: '#fff', cursor: 'pointer' }}>
+                      ↩ Restaurar
+                    </button>
+                  )}
                 </div>
               ))}
             </div>
@@ -968,21 +1035,12 @@ function App() {
           {/* ── footer ── */}
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between',
             padding: '18px 20px', borderTop: '1px solid #ECEEF0', background: '#FAFAF9' }}>
-            {tab === 'list' ? (
+            {tab === 'list' && (
               <button onClick={addSection}
                 style={{ fontSize: 12, color: TEAL, border: `1.5px dashed ${TEAL}`, borderRadius: 7, padding: '7px 20px', letterSpacing: 0.3 }}>
                 + Adicionar seção
               </button>
-            ) : (
-              <button onClick={resetPositions}
-                style={{ fontSize: 12, color: '#8A9099', border: '1.5px solid #DDDFE2', borderRadius: 7, padding: '7px 16px' }}>
-                ↺ Resetar posições
-              </button>
             )}
-            <button onClick={() => { if (window.confirm('Resetar esta aba para o estado inicial?')) { updateActiveTab(() => makeDefaultTab(activeData?.name || 'Feature Timeline')); } }}
-              style={{ fontSize: 11, color: '#C0C4CA', padding: '4px 8px' }}>
-              Resetar dados
-            </button>
           </div>
 
         </div>
